@@ -819,6 +819,15 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
         has_generated_text = False
         sleep_time = 10
 
+        # Cap the inner queueing-retry loop so a silently-rejected request
+        # (e.g. an invalid gem ID that Google neither errors on nor schedules)
+        # cannot wedge the worker forever. Three retries at sleep_time=10s
+        # gives Google ~30s to actually start streaming before we raise
+        # APIError and let the outer @running(retry=...) decorator decide
+        # whether to re-issue the request.
+        queue_retry_count = 0
+        MAX_QUEUE_RETRIES = 3
+
         message_content = [
             prompt,
             0,
@@ -1334,8 +1343,20 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                                 await asyncio.sleep(sleep_time)
                             break
                         elif is_queueing and not has_generated_text:
+                            queue_retry_count += 1
+                            if queue_retry_count > MAX_QUEUE_RETRIES:
+                                await self.close()
+                                raise APIError(
+                                    f"Stuck in queueing state after "
+                                    f"{MAX_QUEUE_RETRIES} retries — the request "
+                                    f"was likely silently rejected by Google "
+                                    f"(e.g. invalid gem ID format, or backend "
+                                    f"issue). (Request ID: {_reqid})"
+                                )
                             logger.debug(
-                                f"Stream suspended while queueing (no CID yet). Retrying request... (Request ID: {_reqid})"
+                                f"Stream suspended while queueing (no CID yet, "
+                                f"retry {queue_retry_count}/{MAX_QUEUE_RETRIES}). "
+                                f"Retrying request... (Request ID: {_reqid})"
                             )
                             await asyncio.sleep(sleep_time)
                             continue
